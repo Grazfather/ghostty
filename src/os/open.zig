@@ -58,6 +58,32 @@ pub fn open(
     thread.detach();
 }
 
+/// Open a filename in the provided application.
+///
+/// Any output on stderr is logged as a warning in the application logs.
+/// Output on stdout is ignored. The allocator is used to buffer the
+/// log output and may allocate from another thread.
+pub fn exec(
+    path: []const u8,
+    filename: []const u8,
+) !void {
+    var spawn_opts: std.process.SpawnOptions = .{ .argv = &.{ path, filename } };
+
+    // Pipe stdout/stderr so we can collect output from the command.
+    // This must be set before spawning the process.
+    spawn_opts.stdout = .pipe;
+    spawn_opts.stderr = .pipe;
+
+    const exe = try std.process.spawn(global.io(), spawn_opts);
+
+    // Create a thread that handles collecting output and reaping the process.
+    // This is done in a separate thread because SOME open implementations block
+    // and some do not. It's easier to just spawn a thread to handle this so
+    // that we never block.
+    const thread = try std.Thread.spawn(.{}, openThread, .{ global.io(), exe });
+    thread.detach();
+}
+
 fn openThread(io: std.Io, exe_: std.process.Child) void {
     // Copy the exe so it is non-const. This is necessary because wait()
     // requires a mutable reference and we can't have one as a thread

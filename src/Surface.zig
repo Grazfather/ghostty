@@ -1620,7 +1620,7 @@ fn mouseRefreshLinks(
 
         const link = (try self.linkAtPos(pos)) orelse break :link .{ null, false };
         switch (link.action) {
-            .open => {
+            .open, .exec, .copy_to_clipboard => {
                 const str = try self.io.terminal.screens.active.selectionString(alloc, .{
                     .sel = link.selection,
                     .trim = false,
@@ -4402,6 +4402,33 @@ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
             try self.openUrl(.{ .kind = .unknown, .url = url_to_open });
         },
 
+        .exec => {
+            const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
+                .sel = link.selection,
+                .trim = false,
+            });
+            defer self.alloc.free(str);
+            try internal_os.exec(
+                link.action.exec,
+                str,
+            );
+        },
+
+        .copy_to_clipboard => {
+            const str = try self.io.terminal.screens.active.selectionString(self.alloc, .{
+                .sel = link.selection,
+                .trim = false,
+            });
+            defer self.alloc.free(str);
+            self.rt_surface.setClipboard(.standard, &.{.{
+                .mime = "text/plain",
+                .data = str,
+            }}, false) catch |err| {
+                log.err("error copying link to clipboard err={}", .{err});
+                return false;
+            };
+        },
+
         ._open_osc8 => {
             const uri = self.osc8URI(link.selection.start()) orelse {
                 log.warn("failed to get URI for OSC8 hyperlink", .{});
@@ -5029,7 +5056,7 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             defer self.renderer_state.mutex.unlock(global.io());
             if (try self.linkAtPos(pos)) |link_info| {
                 const url_text = switch (link_info.action) {
-                    .open => url_text: {
+                    .open, .exec, .copy_to_clipboard => url_text: {
                         // For regex links, get the text from selection
                         break :url_text (self.io.terminal.screens.active.selectionString(self.alloc, .{
                             .sel = link_info.selection,
