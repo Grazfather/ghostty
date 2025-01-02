@@ -26,9 +26,23 @@ pub const Action = union(enum) {
     /// For example, on macOS this is "open" and on Linux this is "xdg-open".
     open: void,
 
+    /// Open the full matched value using the executable program.
+    /// For example, a custom open wrapper to remotely control vim or VS Code
+    exec: []const u8,
+
+    /// Copy the full matched value to the clipboard.
+    copy_to_clipboard: void,
+
     /// Open the OSC8 hyperlink under the mouse position. _-prefixed means
     /// this can't be user-specified, it's only used internally.
     _open_osc8: void,
+
+    pub fn clone(self: *const Action, alloc: Allocator) Allocator.Error!Action {
+        return switch (self.*) {
+            .open, .copy_to_clipboard, ._open_osc8 => self.*,
+            .exec => |v| .{ .exec = try alloc.dupe(u8, v) }
+        };
+    }
 };
 
 pub const Highlight = union(enum) {
@@ -66,7 +80,7 @@ pub fn oniRegex(self: *const Link) !oni.Regex {
 pub fn clone(self: *const Link, alloc: Allocator) Allocator.Error!Link {
     return .{
         .regex = try alloc.dupe(u8, self.regex),
-        .action = self.action,
+        .action = try self.action.clone(alloc),
         .highlight = self.highlight,
     };
 }
