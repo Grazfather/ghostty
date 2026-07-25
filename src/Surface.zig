@@ -4572,7 +4572,13 @@ fn deinitQuickSelect(self: *Surface) void {
     if (self.quick_select) |*qs| {
         qs.deinit(self.alloc);
         self.quick_select = null;
-        self.renderer_state.quick_select = null;
+
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        if (self.renderer_state.quick_select) |*rqs| {
+            rqs.deinit(self.alloc);
+            self.renderer_state.quick_select = null;
+        }
         self.queueRender() catch {};
     }
 }
