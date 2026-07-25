@@ -176,6 +176,9 @@ search: ?Search = null,
 /// Used to rate limit BEL handling.
 last_bell_time: ?std.Io.Timestamp = null,
 
+/// Used to track state of current quick select.
+quick_select: ?QuickSelect = null,
+
 /// The effect of an input event. This can be used by callers to take
 /// the appropriate action after an input event. For example, key
 /// input can be forwarded to the OS for further processing if it
@@ -212,6 +215,16 @@ const Search = struct {
 
         // Now it is safe to deinit the state
         self.state.deinit();
+    }
+};
+
+const QuickSelect = struct {
+    matches: []input.quick_select.Match,
+    input_buf: [2]u8 = .{ 0, 0 },
+    input_len: u8 = 0,
+
+    fn deinit(self: *QuickSelect, alloc: Allocator) void {
+        input.quick_select.freeMatches(alloc, self.matches);
     }
 };
 
@@ -331,6 +344,7 @@ const DerivedConfig = struct {
     title_report: bool,
     links: []DerivedConfig.Link,
     link_previews: configpkg.LinkPreviews,
+    quick_select_alphabet: []const u8,
     scroll_to_bottom: configpkg.Config.ScrollToBottom,
     notify_on_command_finish: configpkg.Config.NotifyOnCommandFinish,
     notify_on_command_finish_action: configpkg.Config.NotifyOnCommandFinishAction,
@@ -410,6 +424,7 @@ const DerivedConfig = struct {
             .title_report = config.@"title-report",
             .links = links,
             .link_previews = config.@"link-previews",
+            .quick_select_alphabet = config.@"quick-select-alphabet",
             .scroll_to_bottom = config.@"scroll-to-bottom",
             .notify_on_command_finish = config.@"notify-on-command-finish",
             .notify_on_command_finish_action = config.@"notify-on-command-finish-action",
@@ -2710,6 +2725,12 @@ pub fn keyCallback(
         event,
         if (insp_ev) |*ev| ev else null,
     )) |v| return v;
+
+    // If we are in quick select mode, intercept all keyboard input.
+    if (self.quick_select != null) {
+        if (try self.handleQuickSelectInput(event)) |effect| return effect;
+    }
+
     // If we allow KAM and KAM is enabled then we do nothing.
     if (self.config.vt_kam_allowed) {
         self.renderer_state.mutex.lockUncancelable(global.io());
@@ -4381,6 +4402,162 @@ fn mouseModsWithCapture(self: *Surface, mods: input.Mods) input.Mods {
     return final;
 }
 
+/// Clean up quick select state and queue a re-render.
+fn deinitQuickSelect(self: *Surface) void {
+    if (self.quick_select) |*qs| {
+        qs.deinit(self.alloc);
+        self.quick_select = null;
+        self.renderer_state.quick_select = null;
+        self.queueRender() catch {};
+    }
+}
+
+/// Copy the current quick select state to the renderer state.
+/// The renderer state mutex must be held.
+fn setRendererQuickSelect(self: *Surface) void {
+    const qs = self.quick_select orelse {
+        self.renderer_state.quick_select = null;
+        return;
+    };
+
+    // Build the renderer matches from our matches.
+    var matches = self.alloc.alloc(
+        rendererpkg.State.QuickSelect.QuickSelectMatch,
+        qs.matches.len,
+    ) catch return;
+
+    for (qs.matches, 0..) |m, i| {
+        matches[i] = .{
+            .hint = self.alloc.dupe(u8, m.hint) catch {
+                // On error, free what we've allocated so far.
+                for (matches[0..i]) |prev| self.alloc.free(prev.hint);
+                self.alloc.free(matches);
+                return;
+            },
+            .start = m.start,
+            .end = m.end,
+        };
+    }
+
+    // Free any previous renderer quick select state.
+    if (self.renderer_state.quick_select) |*old| old.deinit(self.alloc);
+
+    self.renderer_state.quick_select = .{
+        .matches = matches,
+        .input_len = qs.input_len,
+        .input_buf = qs.input_buf,
+    };
+}
+
+/// Execute a link action with the given text.
+fn executeLinkAction(self: *Surface, action: input.Link.Action, text: []const u8) !void {
+    switch (action) {
+        .open => {
+            const resolved_path = try self.resolvePathForOpening(text);
+            defer if (resolved_path) |p| self.alloc.free(p);
+            const url_to_open = resolved_path orelse text;
+            try self.openUrl(.{ .kind = .unknown, .url = url_to_open });
+        },
+        .exec => |path| {
+            try internal_os.exec(path, text);
+        },
+        .copy_to_clipboard => {
+            const str = try self.alloc.dupeZ(u8, text);
+            defer self.alloc.free(str);
+            self.rt_surface.setClipboard(.standard, &.{.{
+                .mime = "text/plain",
+                .data = str,
+            }}, false) catch |err| {
+                log.err("error copying to clipboard err={}", .{err});
+            };
+        },
+        ._open_osc8 => {},
+    }
+}
+
+/// Handle keyboard input while in quick select mode.
+/// Returns `.consumed` if the input was handled, null if not in
+/// quick select mode.
+fn handleQuickSelectInput(
+    self: *Surface,
+    event: input.KeyEvent,
+) !?InputEffect {
+    const qs = &(self.quick_select orelse return null);
+
+    // Only handle press events.
+    if (event.action != .press and event.action != .repeat) return .consumed;
+
+    // Check for escape to cancel.
+    if (event.key == .escape) {
+        self.deinitQuickSelect();
+        return .consumed;
+    }
+
+    // Check for backspace.
+    if (event.key == .backspace) {
+        if (qs.input_len > 0) {
+            qs.input_len -= 1;
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
+            self.setRendererQuickSelect();
+            self.queueRender() catch {};
+        }
+        return .consumed;
+    }
+
+    // Only accept printable ASCII characters.
+    const utf8 = event.utf8;
+    if (utf8.len != 1) return .consumed;
+    const ch = utf8[0];
+    if (ch < 0x20 or ch > 0x7e) return .consumed;
+
+    // Append to input buffer.
+    if (qs.input_len >= 2) return .consumed;
+    qs.input_buf[qs.input_len] = ch;
+    qs.input_len += 1;
+
+    const typed = qs.input_buf[0..qs.input_len];
+
+    // Check for exact match.
+    var exact_match: ?*const input.quick_select.Match = null;
+    var prefix_count: usize = 0;
+    for (qs.matches) |*m| {
+        if (std.mem.eql(u8, m.hint, typed)) {
+            exact_match = m;
+            prefix_count += 1;
+        } else if (std.mem.startsWith(u8, m.hint, typed)) {
+            prefix_count += 1;
+        }
+    }
+
+    if (exact_match) |m| {
+        if (prefix_count == 1 or qs.input_len == 2) {
+            // Execute the action.
+            const text = self.alloc.dupe(u8, m.text) catch return .consumed;
+            defer self.alloc.free(text);
+            const action = m.action;
+            self.deinitQuickSelect();
+            self.executeLinkAction(action, text) catch |err| {
+                log.warn("error executing quick select action err={}", .{err});
+            };
+            return .consumed;
+        }
+    }
+
+    if (prefix_count == 0) {
+        // No matches for this input, cancel.
+        self.deinitQuickSelect();
+        return .consumed;
+    }
+
+    // Still have possible matches, update renderer state.
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.setRendererQuickSelect();
+    self.queueRender() catch {};
+    return .consumed;
+}
+
 /// Attempt to invoke the action of any link that is under the
 /// given position.
 ///
@@ -4909,6 +5086,49 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             } else {
                 self.queueIo(.{ .write_stable = ck.application }, .unlocked);
             }
+        },
+
+        .quick_select => {
+            // If already in quick select mode, cancel it.
+            if (self.quick_select != null) {
+                self.deinitQuickSelect();
+                return true;
+            }
+
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
+
+            // Build compiled links for quick select from our config links.
+            const qs_links = qs_links: {
+                var list: std.ArrayList(input.quick_select.CompiledLink) = .empty;
+                defer list.deinit(self.alloc);
+                for (self.config.links) |link| {
+                    try list.append(self.alloc, .{
+                        .regex = link.regex,
+                        .action = link.action,
+                    });
+                }
+                break :qs_links try list.toOwnedSlice(self.alloc);
+            };
+            defer self.alloc.free(qs_links);
+
+            const matches = input.quick_select.findMatches(
+                self.alloc,
+                self.renderer_state.terminal,
+                qs_links,
+                self.config.quick_select_alphabet,
+            ) catch |err| {
+                log.warn("error finding quick select matches err={}", .{err});
+                return false;
+            };
+
+            if (matches.len == 0) return false;
+
+            self.quick_select = .{
+                .matches = matches,
+            };
+            self.setRendererQuickSelect();
+            self.queueRender() catch {};
         },
 
         .reset => {

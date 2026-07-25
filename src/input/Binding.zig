@@ -943,6 +943,11 @@ pub const Action = union(enum) {
     /// this will report performable as false.
     deactivate_all_key_tables,
 
+    /// Enter quick select mode. Scans the viewport for matches against
+    /// configured link patterns and displays hint labels. Typing a hint
+    /// label performs the link's configured action.
+    quick_select,
+
     /// Quit Ghostty.
     quit,
 
@@ -1405,6 +1410,7 @@ pub const Action = union(enum) {
             .deactivate_key_table,
             .deactivate_all_key_tables,
             .end_key_sequence,
+            .quick_select,
             .crash,
             => .surface,
 

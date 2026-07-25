@@ -1153,6 +1153,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
                 overlay_features: []const Overlay.Feature,
+                quick_select: ?renderer.State.QuickSelect,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1274,12 +1275,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     ) catch &.{};
                 };
 
+                const quick_select: ?renderer.State.QuickSelect = qs: {
+                    const qs = state.quick_select orelse break :qs null;
+                    break :qs qs.clone(arena_alloc) catch break :qs null;
+                };
+
                 break :critical .{
                     .links = links,
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
                     .overlay_features = overlay_features,
+                    .quick_select = quick_select,
                 };
             };
 
@@ -1299,6 +1306,35 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             ) catch |err| {
                 log.warn("error searching for regex links err={}", .{err});
             };
+
+            // If quick select is active, add all match cells to links
+            // for underline highlighting, and force a full rebuild so
+            // dimming and hint overlays are applied.
+            if (critical.quick_select) |qs| {
+                for (qs.matches) |m| {
+                    // Only show matches whose hints still match the typed prefix.
+                    const typed = m.hint[0..@min(qs.input_len, m.hint.len)];
+                    const input_typed = qs.input_buf[0..qs.input_len];
+                    if (!std.mem.startsWith(u8, m.hint, input_typed[0..@min(input_typed.len, typed.len)]))
+                        continue;
+
+                    // Add all cells in this match range to the link set.
+                    var y = m.start.y;
+                    while (y <= m.end.y) : (y += 1) {
+                        const x_start: terminal.size.CellCountInt = if (y == m.start.y) m.start.x else 0;
+                        const x_end: terminal.size.CellCountInt = if (y == m.end.y) m.end.x else self.terminal_state.cols -| 1;
+                        var x = x_start;
+                        while (x <= x_end) : (x += 1) {
+                            critical.links.put(arena_alloc, .{
+                                .x = x,
+                                .y = y,
+                            }, {}) catch {};
+                        }
+                    }
+                }
+                // Force full rebuild for dimming.
+                self.terminal_state.dirty = .full;
+            }
 
             // Clear our highlight state and update.
             if (self.search_matches_dirty or self.terminal_state.dirty != .false) {
@@ -1378,6 +1414,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         .blink_visible = cursor_blink_visible,
                     }),
                     &critical.links,
+                    critical.quick_select,
                 ) catch |err| {
                     // This means we weren't able to allocate our buffer
                     // to update the cells. In this case, we continue with
@@ -2303,6 +2340,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             preedit: ?renderer.State.Preedit,
             cursor_style_: ?renderer.CursorStyle,
             links: *const terminal.RenderState.CellSet,
+            quick_select: ?renderer.State.QuickSelect,
         ) Allocator.Error!void {
             const state: *terminal.RenderState = &self.terminal_state;
 
@@ -2418,6 +2456,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     selection,
                     highlights,
                     links,
+                    quick_select,
                 ) catch |err| {
                     // This should never happen except under exceptional
                     // scenarios. In this case, we don't want to corrupt
@@ -2426,6 +2465,38 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     log.warn("error building row y={} err={}", .{ y, err });
                     self.cells.clear(y);
                 };
+            }
+
+            // Render quick select hint labels on top of the matched cells.
+            if (quick_select) |qs| {
+                const typed = qs.input_buf[0..qs.input_len];
+                for (qs.matches) |m| {
+                    // Skip matches that don't match the typed prefix.
+                    if (!std.mem.startsWith(u8, m.hint, typed)) continue;
+
+                    // Overlay hint characters at the start of the match.
+                    for (m.hint, 0..) |ch, i| {
+                        const hx: terminal.size.CellCountInt = m.start.x +| @as(terminal.size.CellCountInt, @intCast(i));
+                        if (hx >= state.cols) break;
+                        const hy: terminal.size.CellCountInt = @intCast(m.start.y);
+
+                        // Set a bright background for the hint cell.
+                        self.cells.bgCell(hy, hx).* = .{ 255, 200, 64, 255 };
+
+                        // Determine color: already typed chars get dimmer color.
+                        const hint_fg: terminal.color.RGB = if (i < qs.input_len)
+                            .{ .r = 120, .g = 100, .b = 40 }
+                        else
+                            .{ .r = 40, .g = 20, .b = 0 };
+
+                        // Render the hint character glyph.
+                        self.addPreeditCell(
+                            .{ .codepoint = @intCast(ch) },
+                            .{ .x = hx, .y = hy },
+                            hint_fg,
+                        ) catch {};
+                    }
+                }
             }
 
             // Setup our cursor rendering information.
@@ -2602,6 +2673,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             selection: ?[2]terminal.size.CellCountInt,
             highlights: *const std.ArrayList(terminal.RenderState.Highlight),
             links: *const terminal.RenderState.CellSet,
+            quick_select: ?renderer.State.QuickSelect,
         ) !void {
             const state = &self.terminal_state;
 
@@ -2861,7 +2933,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
 
                 // Foreground alpha for this cell.
-                const alpha: u8 = if (style.flags.faint) self.config.faint_opacity else 255;
+                const alpha: u8 = alpha: {
+                    const base: u8 = if (style.flags.faint) self.config.faint_opacity else 255;
+                    // In quick select mode, dim cells that are not part of a match.
+                    if (quick_select != null) {
+                        if (!links.contains(.{
+                            .x = @intCast(x),
+                            .y = @intCast(y),
+                        })) {
+                            break :alpha base / 3;
+                        }
+                    }
+                    break :alpha base;
+                };
 
                 // Set the cell's background color.
                 {

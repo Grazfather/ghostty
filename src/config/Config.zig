@@ -1452,6 +1452,12 @@ link: RepeatableLink = .{},
 /// Available since: 1.2.0
 @"link-previews": LinkPreviews = .true,
 
+/// The alphabet used for quick select hint labels. Each character in this
+/// string becomes a possible hint key. With N characters, up to N single-key
+/// hints are available. If there are more matches than characters, two-key
+/// hints are used, giving up to N*N combinations.
+@"quick-select-alphabet": []const u8 = "asdfghjklqwertyuiopzxcvbnm",
+
 /// Whether to start the window in a maximized state. This setting applies
 /// to new windows and does not apply to tabs, splits, etc. However, this setting
 /// will apply to all new windows, not just the first one.
