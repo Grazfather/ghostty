@@ -230,6 +230,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// a large screen.
         terminal_state_frame_count: usize = 0,
 
+        /// Whether quick select was active on the last frame. Used to force
+        /// a full rebuild when the state transitions.
+        quick_select_active: bool = false,
+
         /// Our overlay state, if any.
         overlay: ?Overlay = null,
 
@@ -1307,15 +1311,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 log.warn("error searching for regex links err={}", .{err});
             };
 
+            // Track quick select transitions to force full rebuilds.
+            const qs_active = critical.quick_select != null;
+            if (qs_active != self.quick_select_active) {
+                self.quick_select_active = qs_active;
+                self.terminal_state.dirty = .full;
+            }
+
             // If quick select is active, add all match cells to links
             // for underline highlighting, and force a full rebuild so
             // dimming and hint overlays are applied.
             if (critical.quick_select) |qs| {
                 for (qs.matches) |m| {
                     // Only show matches whose hints still match the typed prefix.
-                    const typed = m.hint[0..@min(qs.input_len, m.hint.len)];
                     const input_typed = qs.input_buf[0..qs.input_len];
-                    if (!std.mem.startsWith(u8, m.hint, input_typed[0..@min(input_typed.len, typed.len)]))
+                    if (!std.mem.startsWith(u8, m.hint, input_typed))
                         continue;
 
                     // Add all cells in this match range to the link set.
