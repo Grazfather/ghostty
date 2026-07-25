@@ -33,6 +33,9 @@ preedit: ?Preedit = null,
 /// need about the mouse.
 mouse: Mouse = .{},
 
+/// Quick select overlay. Set when quick-select mode is active.
+quick_select: ?QuickSelect = null,
+
 /// The number of threads currently waiting to acquire `mutex` via
 /// `lockDemand`. This is not protected by the mutex; it is read by
 /// hot lock/unlock loops (the IO parse thread) in `yieldToDemand` to
@@ -114,6 +117,44 @@ pub const Mouse = struct {
     /// This could really just be mods in general and we probably will
     /// move it out of mouse state at some point.
     mods: inputpkg.Mods = .{},
+};
+
+/// Quick select overlay state. Set by Surface when quick-select mode is
+/// active. Protected by `mutex`.
+pub const QuickSelect = struct {
+    /// The matches to display with their hint labels.
+    matches: []const QuickSelectMatch,
+    /// How many characters the user has typed so far.
+    input_len: u8,
+    /// The characters typed so far.
+    input_buf: [2]u8,
+
+    pub const QuickSelectMatch = struct {
+        hint: []const u8,
+        start: terminalpkg.point.Coordinate,
+        end: terminalpkg.point.Coordinate,
+    };
+
+    pub fn clone(self: *const QuickSelect, alloc: Allocator) !QuickSelect {
+        var matches = try alloc.alloc(QuickSelectMatch, self.matches.len);
+        for (self.matches, 0..) |m, i| {
+            matches[i] = .{
+                .hint = try alloc.dupe(u8, m.hint),
+                .start = m.start,
+                .end = m.end,
+            };
+        }
+        return .{
+            .matches = matches,
+            .input_len = self.input_len,
+            .input_buf = self.input_buf,
+        };
+    }
+
+    pub fn deinit(self: *const QuickSelect, alloc: Allocator) void {
+        for (self.matches) |m| alloc.free(m.hint);
+        alloc.free(self.matches);
+    }
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.
