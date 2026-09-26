@@ -32,6 +32,18 @@ pub const CompiledLink = struct {
     action: inputpkg.Link.Action,
 };
 
+/// A regex match found in the viewport, without hint or action info.
+/// Text slices reference the viewport string built during search;
+/// callers who need the text to outlive the search must dupe it.
+pub const ViewportMatch = struct {
+    /// First cell of the match (viewport coordinates).
+    start: point.Coordinate,
+    /// Last cell of the match (viewport coordinates, inclusive).
+    end: point.Coordinate,
+    /// The matched text (slice into the viewport string).
+    text: []const u8,
+};
+
 /// Build a UTF-8 string from the terminal viewport along with a byte→cell
 /// coordinate map. Each byte in the output string maps to the viewport
 /// cell coordinate that produced it.
@@ -92,18 +104,19 @@ fn viewportString(
     }
 }
 
-/// Find all matches in the viewport and assign hint labels.
+/// Find all non-overlapping regex matches in the visible viewport.
+/// Returns matches sorted bottom-up, right-to-left.
 ///
-/// The caller owns the returned slice and all strings within it.
-/// Call `freeMatches` to release.
+/// The returned `ViewportMatch.text` slices reference the viewport string
+/// built internally; the caller must dupe any text they need to keep and
+/// then call `freeViewportMatches` to release the returned slice.
 /// The renderer state mutex must be held.
-pub fn findMatches(
+pub fn searchViewport(
     alloc: Allocator,
     t: *terminal.Terminal,
-    links: []CompiledLink,
-    alphabet: []const u8,
-) ![]Match {
-    if (links.len == 0 or alphabet.len == 0) return &.{};
+    regexes: []oni.Regex,
+) ![]ViewportMatch {
+    if (regexes.len == 0) return &.{};
 
     // Convert viewport to string + byte→cell map.
     var builder: std.Io.Writer.Allocating = .init(alloc);
@@ -115,14 +128,14 @@ pub fn findMatches(
     const str = builder.writer.buffered();
     if (str.len == 0) return &.{};
 
-    // Collect raw matches (before hint assignment).
-    var raw_matches: std.ArrayList(RawMatch) = .empty;
-    defer raw_matches.deinit(alloc);
+    // Collect matches.
+    var raw: std.ArrayListUnmanaged(ViewportMatch) = .empty;
+    defer raw.deinit(alloc);
 
-    for (links) |*link| {
+    for (regexes) |*regex| {
         var offset: usize = 0;
         while (offset < str.len) {
-            var region = link.regex.search(
+            var region = regex.search(
                 str[offset..],
                 .{},
             ) catch |err| switch (err) {
@@ -148,7 +161,7 @@ pub fn findMatches(
 
             // Check for overlaps with existing matches and skip if so.
             var overlaps = false;
-            for (raw_matches.items) |existing| {
+            for (raw.items) |existing| {
                 if (rangesOverlap(
                     cell_start,
                     cell_end,
@@ -161,45 +174,98 @@ pub fn findMatches(
             }
             if (overlaps) continue;
 
-            try raw_matches.append(alloc, .{
+            try raw.append(alloc, .{
                 .start = cell_start,
                 .end = cell_end,
-                .text = str[start..end],
-                .action = link.action,
+                .text = try alloc.dupe(u8, str[start..end]),
             });
         }
     }
 
-    if (raw_matches.items.len == 0) return &.{};
+    if (raw.items.len == 0) return &.{};
 
     // Sort matches bottom-up, right-to-left so that the closest
     // matches (at the bottom of the viewport) get the shortest hints.
-    std.mem.sortUnstable(RawMatch, raw_matches.items, {}, struct {
-        fn lessThan(_: void, a: RawMatch, b: RawMatch) bool {
+    std.mem.sortUnstable(ViewportMatch, raw.items, {}, struct {
+        fn lessThan(_: void, a: ViewportMatch, b: ViewportMatch) bool {
             if (a.start.y != b.start.y) return a.start.y > b.start.y;
             return a.start.x > b.start.x;
         }
     }.lessThan);
 
+    return try alloc.dupe(ViewportMatch, raw.items);
+}
+
+/// Free matches returned by `searchViewport`.
+pub fn freeViewportMatches(alloc: Allocator, matches: []ViewportMatch) void {
+    for (matches) |m| {
+        alloc.free(m.text);
+    }
+    alloc.free(matches);
+}
+
+/// Find all matches in the viewport and assign hint labels.
+///
+/// The caller owns the returned slice and all strings within it.
+/// Call `freeMatches` to release.
+/// The renderer state mutex must be held.
+pub fn findMatches(
+    alloc: Allocator,
+    t: *terminal.Terminal,
+    links: []CompiledLink,
+    alphabet: []const u8,
+) ![]Match {
+    if (links.len == 0 or alphabet.len == 0) return &.{};
+
+    // Extract regexes from links.
+    var regexes = try alloc.alloc(oni.Regex, links.len);
+    defer alloc.free(regexes);
+    for (links, 0..) |link, i| {
+        regexes[i] = link.regex;
+    }
+
+    // Find viewport matches.
+    const vp_matches = try searchViewport(alloc, t, regexes);
+    defer freeViewportMatches(alloc, vp_matches);
+
+    if (vp_matches.len == 0) return &.{};
+
     // Assign hints.
-    const hints = try assignHints(alloc, raw_matches.items.len, alphabet);
+    const hints = try assignHints(alloc, vp_matches.len, alphabet);
     defer alloc.free(hints);
 
-    // Build final Match array.
-    var matches = try alloc.alloc(Match, raw_matches.items.len);
+    // Build final Match array, associating each match with the action
+    // from the first link whose regex produced it. Since searchViewport
+    // iterates regexes in order, we look up by re-matching. For
+    // simplicity we use the first link's action — the ordering of
+    // links determines priority for overlapping patterns.
+    var matches = try alloc.alloc(Match, vp_matches.len);
     errdefer alloc.free(matches);
 
-    for (raw_matches.items, 0..) |raw, i| {
+    for (vp_matches, 0..) |vm, i| {
         matches[i] = .{
             .hint = hints[i],
-            .start = raw.start,
-            .end = raw.end,
-            .text = try alloc.dupe(u8, raw.text),
-            .action = raw.action,
+            .start = vm.start,
+            .end = vm.end,
+            .text = try alloc.dupe(u8, vm.text),
+            .action = findActionForMatch(vm.text, links),
         };
     }
 
     return matches;
+}
+
+/// Determine which link action to associate with a matched text by
+/// re-running each link's regex against it. Returns the action of the
+/// first link whose regex matches.
+fn findActionForMatch(text: []const u8, links: []CompiledLink) inputpkg.Link.Action {
+    for (links) |*link| {
+        _ = link.regex.search(text, .{}) catch continue;
+        return link.action;
+    }
+    // Fallback — should not happen since the text came from one of
+    // these regexes, but return the first action as a safe default.
+    return links[0].action;
 }
 
 /// Free matches returned by `findMatches`.
@@ -210,13 +276,6 @@ pub fn freeMatches(alloc: Allocator, matches: []Match) void {
     }
     alloc.free(matches);
 }
-
-const RawMatch = struct {
-    start: point.Coordinate,
-    end: point.Coordinate,
-    text: []const u8,
-    action: inputpkg.Link.Action,
-};
 
 fn rangesOverlap(
     a_start: point.Coordinate,
