@@ -8801,7 +8801,7 @@ pub const RepeatableLink = struct {
 
         const EXEC_PREFIX = "exec:";
         if (std.mem.startsWith(u8, actionValue, EXEC_PREFIX)) {
-            const execPath = actionValue[EXEC_PREFIX.len..eqlIdx];
+            const execPath = actionValue[EXEC_PREFIX.len..];
             try self.links.append(alloc, .{
                 .regex = try alloc.dupeSentinel(u8, pattern, 0),
                 .action = .{ .exec = try alloc.dupeSentinel(u8, execPath, 0) },
