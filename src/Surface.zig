@@ -4633,7 +4633,7 @@ fn executeLinkAction(self: *Surface, action: input.Link.Action, text: []const u8
             try internal_os.exec(path, text);
         },
         .copy_to_clipboard => {
-            const str = try self.alloc.dupeZ(u8, text);
+            const str = try self.alloc.dupeSentinel(u8, text, 0);
             defer self.alloc.free(str);
             self.rt_surface.setClipboard(.standard, &.{.{
                 .mime = "text/plain",

@@ -8803,8 +8803,8 @@ pub const RepeatableLink = struct {
         if (std.mem.startsWith(u8, actionValue, EXEC_PREFIX)) {
             const execPath = actionValue[EXEC_PREFIX.len..eqlIdx];
             try self.links.append(alloc, .{
-                .regex = try alloc.dupeZ(u8, pattern),
-                .action = .{ .exec = try alloc.dupeZ(u8, execPath) },
+                .regex = try alloc.dupeSentinel(u8, pattern, 0),
+                .action = .{ .exec = try alloc.dupeSentinel(u8, execPath, 0) },
                 .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
             });
             return;
@@ -8818,7 +8818,7 @@ pub const RepeatableLink = struct {
         };
 
         try self.links.append(alloc, .{
-            .regex = try alloc.dupeZ(u8, pattern),
+            .regex = try alloc.dupeSentinel(u8, pattern, 0),
             .action = action,
             .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
         });
